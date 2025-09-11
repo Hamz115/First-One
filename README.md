@@ -1,277 +1,245 @@
-# GraspGen Complete Setup and Understanding Guide
+# Multi-Object Grasp Generation Pipeline Documentation
 
-## What is GraspGen?
+## Overview
+This document explains how to generate robotic grasps for multiple objects in a single scene using GraspGen.
 
-GraspGen is a modular framework for **diffusion-based 6-DOF robotic grasp generation**. It uses AI to predict where and how a robot should grasp objects in 3D space.
+## The Challenge
+GraspGen is designed to process ONE object at a time. When you have a scene with multiple objects (like a basket with items inside), you need a strategy to:
+1. Separate each object
+2. Generate grasps for each individually
+3. Combine results
 
-### Key Capabilities:
-- **Multiple Gripper Types**: Works with industrial pinch grippers and suction grippers
-- **Flexible Input**: Handles both partial and complete 3D point clouds
-- **Complex Scenarios**: Can grasp single objects or objects in cluttered scenes
-- **6-DOF Grasps**: Generates full 6 degrees-of-freedom grasps (3D position + 3D orientation)
+## Input Requirements
 
-## System Requirements
+### 1. RGB Image (RGB2.png)
+- Standard color image from your camera
+- Shows all objects in the scene
 
-- **GPU**: NVIDIA GPU with CUDA support (8GB+ VRAM recommended)
-- **CUDA**: Version 11.x or 12.x (Note: CUDA 12.8 has issues with PTV3 backbone)
-- **Python**: 3.8 or higher
-- **OS**: Linux (Ubuntu 20.04/22.04 recommended)
-- **RAM**: 16GB+ recommended
-- **Storage**: ~50GB for models and datasets
+### 2. Depth Image (DEPTH.png)
+- 16-bit depth map
+- Each pixel value = distance from camera (usually in millimeters)
+- Used to convert 2D pixels to 3D points
 
-## Installation Options
+### 3. Segmentation Mask (final_filtered_segmentation_map.png)
+- **CRITICAL**: Each object has a unique ID number
+- Background = 0
+- Object 1 = some number (e.g., 200)
+- Object 2 = different number (e.g., 85)
+- etc.
 
-You have two main installation paths:
+## The Pipeline
 
-### Option 1: Docker Installation (Recommended for Training)
-Best if you want to train models or have a clean, isolated environment.
+### Stage 1: 2D to 3D Conversion
 
-### Option 2: Pip Installation (For Inference Only)
-Best if you just want to run pre-trained models for grasp generation.
-
----
-
-## Step-by-Step Setup Guide
-
-### Step 1: Clone the Repository
-
-```bash
-# If you haven't already cloned it
-git clone https://github.com/NVlabs/GraspGen.git
-cd GraspGen
+```
+RGB Image + Depth Image → 3D Point Cloud
 ```
 
-### Step 2: Download Pre-trained Models
-
-```bash
-# Download the pre-trained models (required for inference)
-# These include checkpoints for different gripper types
-wget https://huggingface.co/datasets/changhaonan/GraspGen/resolve/main/models.tar.gz
-tar -xzf models.tar.gz
+The math (simplified):
+```python
+# For each pixel:
+3D_point.z = depth_value / 1000  # Convert to meters
+3D_point.x = (pixel_x - camera_center_x) * z / focal_length
+3D_point.y = (pixel_y - camera_center_y) * z / focal_length
+3D_point.color = RGB_image[pixel_x, pixel_y]
 ```
 
-### Step 3: Choose Your Installation Method
+### Stage 2: Object Extraction
 
-## Option A: Docker Installation (Recommended)
-
-### Step 3A.1: Install Docker and NVIDIA Container Toolkit
-
-```bash
-# Install Docker
-sudo apt-get update
-sudo apt-get install docker.io
-sudo systemctl start docker
-sudo systemctl enable docker
-
-# Add your user to docker group
-sudo usermod -aG docker $USER
-# Log out and back in for this to take effect
-
-# Install NVIDIA Container Toolkit
-distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
-curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -
-curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | sudo tee /etc/apt/sources.list.d/nvidia-docker.list
-
-sudo apt-get update
-sudo apt-get install -y nvidia-container-toolkit
-sudo systemctl restart docker
+```
+Full Point Cloud + Segmentation Mask → Individual Object Point Clouds
 ```
 
-### Step 3A.2: Build Docker Image
+For each unique ID in the mask:
+1. Find all pixels with that ID
+2. Extract corresponding 3D points
+3. Save as separate point cloud
 
-```bash
-# From the GraspGen directory
-bash docker/build.sh
+Example from your scene:
+- Object ID 200 → 2,468 pixels → 1,680 3D points (basket)
+- Object ID 85 → 1,650 pixels → ~1,200 3D points (yellow object)
+
+### Stage 3: GraspGen Processing Loop
+
+```
+FOR each object:
+    object_points → GraspGen → grasps + scores
 ```
 
-### Step 3A.3: Run Docker Container
-
-For inference only:
-```bash
-bash docker/run.sh $(pwd) --models $(pwd)/models
+The loop:
+```python
+for object_id in [200, 85, 212, 134, 72, 38]:
+    # 1. Load object point cloud
+    points = load_object(object_id)
+    
+    # 2. Run GraspGen
+    grasps, scores = GraspGen.generate(points, num_grasps=100)
+    
+    # 3. Filter by quality
+    good_grasps = grasps[scores > 0.7]
+    
+    # 4. Take top 20
+    top_grasps = good_grasps[:20]
+    
+    # 5. Save results
+    save_grasps(object_id, top_grasps)
 ```
 
-For training (if you have datasets):
-```bash
-bash docker/run.sh $(pwd) \
-    --models $(pwd)/models \
-    --grasp_dataset /path/to/grasp_dataset \
-    --object_dataset /path/to/object_dataset \
-    --results $(pwd)/results
+### Stage 4: Results Combination
+
+```
+Individual Grasps → Combined Grasp Set
 ```
 
-## Option B: Pip Installation (Inference Only)
-
-### Step 3B.1: Create Python Environment
-
-```bash
-# Create conda environment (recommended)
-conda create -n graspgen python=3.9
-conda activate graspgen
-
-# Or use venv
-python3 -m venv graspgen_env
-source graspgen_env/bin/activate
+All grasps are combined with tracking:
+```json
+{
+  "object_id": 200,
+  "grasp": [4x4 transformation matrix],
+  "score": 0.95,
+  "grasp_idx": 0
+}
 ```
 
-### Step 3B.2: Install PyTorch
+## File Structure
 
-```bash
-# Install PyTorch with CUDA support (adjust CUDA version as needed)
-# For CUDA 11.8
-pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cu118
-
-# For CUDA 12.1
-pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu121
+### Input Files
+```
+test_scene/
+├── RGB2.png                    # Color image
+├── DEPTH.png                   # Depth map
+└── final_filtered_segmentation_map.png  # Object masks
 ```
 
-### Step 3B.3: Install GraspGen
-
-```bash
-# Install main package
-pip install -e .
-
-# Install PointNet++ operations
-cd pointnet2_ops
-pip install -e .
-cd ..
-
-# Install additional dependencies
-pip install pyrender PyOpenGL==3.1.5 transformers diffusers==0.11.1 timm huggingface-hub==0.25.2 scene-synthesizer[recommend]
-
-# Install visualization tools
-pip install meshcat trimesh
+### Generated Files
+```
+custom_scenes_multi/
+├── object_200.json             # Basket point cloud data
+├── object_200_grasps.json      # Basket grasp poses
+├── object_200_object.ply       # 3D visualization file
+├── object_200_scene.ply        # Full scene for context
+├── object_85.json              # Yellow object 1 data
+├── object_85_grasps.json       # Yellow object 1 grasps
+... (same pattern for each object)
+└── all_grasps_combined.json    # All 216 grasps together
 ```
 
-### Step 4: Verify Installation
+## Scripts Explained
 
+### 1. process_custom_scene.py
+- **Purpose**: Convert RGB-D to point cloud for ONE object
+- **Input**: RGB, Depth, Mask, Object ID
+- **Output**: JSON file in GraspGen format
+
+### 2. process_all_objects.py
+- **Purpose**: Automate processing for ALL objects
+- **Process**: 
+  1. Find all object IDs in mask
+  2. Call process_custom_scene.py for each
+  3. Run GraspGen on each
+  4. Combine results
+
+### 3. visualize_all_grasps.py
+- **Purpose**: Show all objects and grasps together
+- **Features**:
+  - Color-codes each object
+  - Shows top grasps per object
+  - Quality-based coloring
+
+## Results from Your Scene
+
+| Object ID | Description | Pixels | 3D Points | Grasps Generated | Best Score |
+|-----------|------------|--------|-----------|------------------|------------|
+| 200 | Basket | 2,468 | 1,680 | 40 | 0.949 |
+| 85 | Yellow Object 1 | 1,650 | ~1,200 | 40 | 0.942 |
+| 212 | Object 2 | 1,079 | ~800 | 40 | 0.949 |
+| 134 | Small Object | 437 | ~300 | 6 | 0.758 |
+| 72 | Small Object | 346 | ~250 | 50 | 0.805 |
+| 38 | Tiny Object | 177 | ~120 | 40 | 0.879 |
+
+**Total: 216 grasps across 6 objects**
+
+## Key Concepts
+
+### Why Not Process Everything at Once?
+GraspGen's neural network is trained on single objects. It:
+- Expects one coherent object point cloud
+- Generates grasps for that specific geometry
+- Cannot distinguish between multiple objects
+
+### Why Use Segmentation?
+Without segmentation, you'd only get grasps for the dominant object (usually the largest). Segmentation lets you:
+- Process each object optimally
+- Know which grasp belongs to which object
+- Handle cluttered scenes
+
+### Grasp Quality Scores
+- **0.9-1.0**: Excellent grasp (green in visualization)
+- **0.8-0.9**: Good grasp (yellow)
+- **0.7-0.8**: Acceptable (orange)
+- **<0.7**: Rejected (not shown)
+
+## Running the Complete Pipeline
+
+### Quick Start (Your Test Scene)
 ```bash
-# Test import
-python -c "import grasp_gen; print('GraspGen imported successfully')"
+# Process all objects and generate grasps
+docker exec graspgen-main /bin/bash -c "cd /code && python process_all_objects.py"
 
-# Run tests
-python -m pytest tests/test_rotation_conversions.py -v
+# Visualize results
+docker exec graspgen-main /bin/bash -c "cd /code && python visualize_all_grasps.py"
+
+# View at: http://localhost:7000/static/
 ```
 
-### Step 5: Start Visualization Server (Optional)
-
-For 3D visualization of grasps:
-```bash
-# In a separate terminal
-meshcat-server
-
-# Or use Docker
-bash docker/run_meshcat.sh
-```
-
-Open browser at `http://localhost:7000/static/`
-
----
-
-## Running Your First Demo
-
-### Demo 1: Object Point Cloud Grasp Generation
-
-```bash
-# Navigate to GraspGen directory
-cd /path/to/GraspGen
-
-# Run demo with sample data
-python scripts/demo_object_pc.py \
-    --sample_data_dir models/sample_data/real_object_pc \
-    --gripper_config models/checkpoints/graspgen_robotiq_2f_140.yml
-```
-
-### Demo 2: Scene Point Cloud Grasp Generation
-
-```bash
-python scripts/demo_scene_pc.py \
-    --sample_data_dir models/sample_data/real_scene_pc \
-    --gripper_config models/checkpoints/graspgen_robotiq_2f_140.yml
-```
-
-### Demo 3: Object Mesh Grasp Generation
-
-```bash
-python scripts/demo_object_mesh.py \
-    --mesh_file models/sample_data/meshes/box.obj \
-    --mesh_scale 1.0 \
-    --gripper_config models/checkpoints/graspgen_robotiq_2f_140.yml
-```
-
----
-
-## Understanding the Output
-
-When you run a demo, GraspGen will:
-1. Load the input (point cloud or mesh)
-2. Generate multiple grasp candidates using diffusion
-3. Score and rank grasps using the discriminator
-4. Visualize the top grasps (if MeshCat is running)
-5. Save results to `results/` directory
-
-### Output Files:
-- `grasps.npz`: Generated grasp poses (4x4 transformation matrices)
-- `scores.txt`: Grasp quality scores
-- `visualization.html`: 3D visualization (if enabled)
-
----
+### For New Scenes
+1. Capture RGB, Depth, and Segmentation mask
+2. Place in a folder
+3. Modify paths in process_all_objects.py
+4. Run the pipeline
 
 ## Troubleshooting
 
-### Common Issues:
+### "No points found for object ID X"
+- Check mask values match what you specify
+- Ensure object is visible in depth image
+- Verify depth values are valid (not 0)
 
-1. **CUDA Out of Memory**
-   - Reduce batch size in inference scripts
-   - Use smaller point cloud samples
+### Too few grasps generated
+- Object might be too small (<100 points)
+- Lower grasp_threshold (try 0.6)
+- Increase num_grasps parameter
 
-2. **ImportError for grasp_gen**
-   - Make sure you're in the correct environment
-   - Verify installation with `pip list | grep grasp`
+### Grasps look wrong
+- Check camera intrinsics are correct
+- Verify depth_scale (1000 for mm, 1 for m)
+- Ensure point cloud looks correct in PLY files
 
-3. **MeshCat not showing visualization**
-   - Ensure meshcat-server is running
-   - Check firewall settings for port 7000
+## Advanced Options
 
-4. **Docker permission denied**
-   - Run `sudo usermod -aG docker $USER` and re-login
-
-5. **CUDA version mismatch**
-   - Check CUDA version: `nvidia-smi`
-   - Install matching PyTorch version
-
----
-
-## Next Steps
-
-1. **Try Different Grippers**: Change `--gripper_config` to test other gripper types
-2. **Use Your Own Data**: Prepare point clouds or meshes of your objects
-3. **Train Custom Models**: Follow training guides in `docs/` directory
-4. **Integrate with Robot**: Use generated grasps with your robot control system
-
----
-
-## Quick Reference Commands
-
-```bash
-# Check GPU
-nvidia-smi
-
-# Check CUDA version
-nvcc --version
-
-# Monitor GPU usage during inference
-watch -n 1 nvidia-smi
-
-# List available gripper configs
-ls models/checkpoints/*.yml
-
-# View sample data
-ls models/sample_data/
+### Process Specific Objects Only
+```python
+# In process_all_objects.py, modify:
+object_ids = [200, 85]  # Only process basket and first object
 ```
 
-## Getting Help
+### Change Gripper Type
+```python
+gripper_config = "/models/checkpoints/graspgen_franka_panda.yml"  # or suction
+```
 
-- Check `docs/` directory for detailed documentation
-- Review test files in `tests/` for usage examples
-- Look at demo scripts in `scripts/` for implementation patterns
+### Adjust Grasp Generation
+```python
+num_grasps=200  # Generate more candidates
+top_k=30       # Keep more grasps per object
+grasp_threshold=0.6  # Lower quality threshold
+```
+
+## Summary
+This pipeline solves the multi-object grasping problem by:
+1. Using segmentation to identify individual objects
+2. Processing each object separately through GraspGen
+3. Combining results for comprehensive scene grasping
+4. Maintaining object-grasp associations for execution
+
+The result: High-quality, object-specific grasps for complex scenes with multiple graspable items.
